@@ -11,9 +11,45 @@ export const ConnectionConfigSchema = z.object({
   connectionTimeout: z.number().optional().default(30000),
   requestTimeout: z.number().optional().default(60000),
   maxRows: z.number().optional().default(1000),
+  sessionContext: z
+    .record(z.union([z.string(), z.number()]))
+    .optional(),
+  sessionContextReadOnly: z.boolean().optional().default(true),
 });
 
 export type ConnectionConfig = z.infer<typeof ConnectionConfigSchema>;
+
+/**
+ * Parses SQLSERVER_SESSION_CONTEXT, a JSON object of key/value pairs applied to
+ * every query via sp_set_session_context. Used by Row-Level Security predicates
+ * that scope rows by tenant or user rather than by login.
+ */
+export function parseSessionContext(
+  raw: string | undefined
+): ConnectionConfig['sessionContext'] {
+  if (!raw || !raw.trim()) {
+    return undefined;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(
+      'SQLSERVER_SESSION_CONTEXT must be a JSON object, e.g. {"TenantId":42}'
+    );
+  }
+
+  const result = ConnectionConfigSchema.shape.sessionContext.safeParse(parsed);
+  if (!result.success) {
+    throw new Error(
+      'SQLSERVER_SESSION_CONTEXT must be a JSON object whose values are ' +
+        'strings or numbers, e.g. {"TenantId":42,"UserRole":"auditor"}'
+    );
+  }
+
+  return result.data;
+}
 
 export interface TableInfo {
   table_catalog: string;
