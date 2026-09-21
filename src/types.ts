@@ -41,6 +41,18 @@ export function parseSessionContext(
   }
 
   const result = ConnectionConfigSchema.shape.sessionContext.safeParse(parsed);
+  if (result.success && result.data) {
+    // sql_variant cannot hold nvarchar(max), so values bind as nvarchar(4000).
+    const tooLong = Object.entries(result.data).find(
+      ([, v]) => typeof v === 'string' && v.length > 4000
+    );
+    if (tooLong) {
+      throw new Error(
+        `SQLSERVER_SESSION_CONTEXT value for '${tooLong[0]}' exceeds 4000 ` +
+          'characters, which sql_variant cannot store'
+      );
+    }
+  }
   if (!result.success) {
     throw new Error(
       'SQLSERVER_SESSION_CONTEXT must be a JSON object whose values are ' +

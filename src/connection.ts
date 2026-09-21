@@ -77,7 +77,10 @@ export class SqlServerConnection {
       if (typeof value === 'number') {
         request.input(valueParam, sql.Int, value);
       } else {
-        request.input(valueParam, sql.NVarChar(sql.MAX), value);
+        // sql_variant, the type of sp_set_session_context's @value, cannot hold
+        // the LOB types -- nvarchar(max) included -- so strings bind as
+        // nvarchar(4000). parseSessionContext rejects anything longer.
+        request.input(valueParam, sql.NVarChar(4000), value);
       }
 
       const exec =
