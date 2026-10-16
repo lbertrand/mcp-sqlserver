@@ -75,6 +75,13 @@ const FORBIDDEN_KEYWORDS = new Set([
   // procedural statements
   'DECLARE', 'IF', 'WHILE', 'BREAK', 'CONTINUE', 'PRINT', 'RAISERROR', 'THROW',
   'DEALLOCATE',
+  // reserved words that only begin statements (cursors, savepoints, text
+  // columns, ALTER ... ADD). Being reserved, a bare use as a column name is
+  // already a syntax error, so blocking them costs nothing. Words that merely
+  // begin a statement but are ordinary identifiers (SEND, RECEIVE, MOVE, GET,
+  // ENABLE, DISABLE, LOAD, DUMP) are NOT listed: they would reject real columns,
+  // and what they could do is gated by database permissions.
+  'OPEN', 'CLOSE', 'ADD', 'SAVE', 'READTEXT', 'WRITETEXT', 'UPDATETEXT',
   // remote / out-of-band data access. OPENJSON is deliberately absent: it
   // only parses a string already in the query and reaches nothing outside it.
   'OPENQUERY', 'OPENROWSET', 'OPENDATASOURCE', 'OPENXML',
@@ -384,7 +391,12 @@ export class QueryValidator {
    * different rows.
    */
   static sanitizeQuery(query: string): string {
-    return query.trim().replace(/[\s;]+$/, '');
+    // Walk back from the end. A regex such as /[\s;]+$/ looks equivalent but
+    // backtracks quadratically on a long run of spaces or semicolons that is
+    // not at the end, and this runs on queries the validator has accepted.
+    let end = query.length;
+    while (end > 0 && (query[end - 1] === ';' || /\s/.test(query[end - 1]))) end--;
+    return query.slice(0, end).trim();
   }
 
   /**

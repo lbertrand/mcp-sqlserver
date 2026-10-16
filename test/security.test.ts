@@ -38,6 +38,7 @@ const MUST_BLOCK_KEYWORDS = [
   'RECONFIGURE', 'CHECKPOINT', 'USE', 'SET', 'SETUSER', 'REVERT', 'BEGIN',
   'COMMIT', 'ROLLBACK', 'TRAN', 'TRANSACTION', 'DECLARE', 'IF', 'WHILE',
   'BREAK', 'CONTINUE', 'PRINT', 'RAISERROR', 'THROW', 'DEALLOCATE',
+  'OPEN', 'CLOSE', 'ADD', 'SAVE', 'READTEXT', 'WRITETEXT', 'UPDATETEXT',
   'OPENQUERY', 'OPENROWSET', 'OPENDATASOURCE', 'OPENXML',
 ];
 
@@ -669,4 +670,152 @@ test('row limit: the rewrite only inserts text', () => {
     assert.ok(recoverable, `lossy rewrite:\n  in : ${JSON.stringify(q)}\n  out: ${JSON.stringify(out)}`);
   }
   assert.ok(n > 100, `only ${n} rewrites exercised`);
+});
+
+// ---------------------------------------------------------------------------
+// 7. Hostile input, lookalikes, and statement coverage
+// ---------------------------------------------------------------------------
+
+test('performance: hostile input cannot stall the event loop', () => {
+  // The server is single-threaded, so a query that takes a minute to *check*
+  // stalls every caller. A regex-based sanitizer once did exactly that on a
+  // long run of spaces or semicolons (quadratic backtracking).
+  const N = 50_000;
+  const budgetMs = 500;
+  const hostile: Array<[string, () => unknown]> = [
+    ['spaces mid-query, sanitize', () => QueryValidator.sanitizeQuery('SELECT 1' + ' '.repeat(N) + 'x')],
+    ['"; " runs mid-query, sanitize', () => QueryValidator.sanitizeQuery('SELECT 1' + '; '.repeat(N / 2) + 'x')],
+    ['semicolons mid-query, sanitize', () => QueryValidator.sanitizeQuery('SELECT 1' + ';'.repeat(N) + 'x')],
+    ['spaces mid-query, validate', () => QueryValidator.validateQuery('SELECT 1' + ' '.repeat(N) + 'x')],
+    ['row limit, wide select list', () => QueryValidator.addRowLimit('SELECT ' + 'a,'.repeat(N) + 'b', 1000)],
+    ['nested comments', () => QueryValidator.validateQuery('SELECT 1 ' + '/*'.repeat(N) + '*/'.repeat(N))],
+    ['open parentheses', () => QueryValidator.validateQuery('SELECT ' + '('.repeat(N * 4))],
+    ['huge literal', () => QueryValidator.validateQuery("SELECT '" + 'a'.repeat(N * 20) + "'")],
+    ['doubled quotes', () => QueryValidator.validateQuery("SELECT '" + "''".repeat(N) + "'")],
+    ['unterminated brackets', () => QueryValidator.validateQuery('SELECT ' + '['.repeat(N))],
+    ['many tiny tokens', () => QueryValidator.validateQuery('SELECT ' + 'a,'.repeat(N) + 'b')],
+  ];
+  const slow: string[] = [];
+  for (const [label, run] of hostile) {
+    const start = performance.now();
+    run();
+    const ms = performance.now() - start;
+    if (ms > budgetMs) slow.push(`${label}: ${ms.toFixed(0)} ms`);
+  }
+  assert.equal(slow.length, 0, `over the ${budgetMs} ms budget:\n  ${slow.join('\n  ')}`);
+});
+
+test('sanitize: agrees with the obvious regex on every small input', () => {
+  // the regex is the specification; the loop exists only because the regex is slow
+  const reference = (q: string) => q.trim().replace(/[\s;]+$/, '');
+  const alphabet = ['a', 'x', ' ', ' ', ';', '\n', '\t', '\r', "'", '-'];
+  const rnd = mulberry32(2718);
+  for (let i = 0; i < 30_000; i++) {
+    const q = Array.from({ length: Math.floor(rnd() * 12) }, () => alphabet[Math.floor(rnd() * alphabet.length)]).join('');
+    assert.equal(QueryValidator.sanitizeQuery(q), reference(q), JSON.stringify(q));
+  }
+});
+
+test('tokenizer: never silently drops code', () => {
+  // Between consecutive tokens there may only be whitespace and comments. If
+  // anything else were skipped, a keyword could sit in the gap unseen.
+  const stripComments = (gap: string) => {
+    let prev = '';
+    let s = gap;
+    while (s !== prev) { prev = s; s = s.replace(/\/\*(?:(?!\/\*|\*\/)[\s\S])*\*\//g, ' '); }
+    return s.replace(/--[^\n]*/g, ' ');
+  };
+  const rnd = mulberry32(5);
+  const pool = ['SELECT', 'a', '1', '1.5', '0x1F', "'x'", "''''", '[b]', '"c"', '/*c*/', '--c\n', ' ', '\n', '\t', ',', '(', ')',
+    '.', '*', '@v', '@@v', ';', 'EXEC', 'e5', "N's'", '/*a/*b*/c*/'];
+  let lexed = 0;
+  const bad: string[] = [];
+  for (let i = 0; i < 100_000; i++) {
+    const q = Array.from({ length: 1 + Math.floor(rnd() * 10) }, () => pool[Math.floor(rnd() * pool.length)]).join(rnd() < 0.5 ? ' ' : '');
+    let tokens;
+    try { tokens = tokenize(q); } catch { continue; }
+    lexed++;
+    let at = 0;
+    const gaps: string[] = [];
+    for (const tk of tokens) { gaps.push(q.slice(at, tk.start)); at = tk.start + tk.value.length; }
+    gaps.push(q.slice(at));
+    if (gaps.some(g => stripComments(g).trim() !== '')) bad.push(JSON.stringify(q));
+  }
+  assert.equal(bad.length, 0, `code fell between tokens:\n  ${bad.slice(0, 5).join('\n  ')}`);
+  assert.ok(lexed > 10_000, `only ${lexed} inputs lexed`);
+});
+
+test('unicode: lookalikes and case-folding tricks never form a keyword', () => {
+  // None of these may be accepted outside a literal. The tokenizer is ASCII-only
+  // for code, so there is no folding step an attacker can lean on.
+  expectAll([
+    ['fullwidth EXEC', 'SELECT 1 ＥＸＥＣ sp_who'],
+    ['Cyrillic E in EXEC', 'SELECT 1 ЕXEC sp_who'],
+    ['Cyrillic X and C in EXEC', 'SELECT 1 EХEС sp_who'],
+    ['long s in SHUTDOWN (uppercases to S)', 'SELECT 1 ſHUTDOWN'],
+    ['Kelvin sign in KILL (lowercases to k)', 'SELECT 1 KILL 55'],
+    ['dotless i in IF', 'SELECT 1 ıF 1=1 SELECT 2'],
+    ['circled letters', 'SELECT 1 ⒺⓍⒺⒸ sp_who'],
+    ['soft hyphen inside EXEC', 'SELECT 1 EX­EC sp_who'],
+    ['combining mark after EXEC', 'SELECT 1 EXEĆ sp_who'],
+    ['emoji outside a literal', 'SELECT 😀 FROM t'],
+    ['lone surrogate outside a literal', 'SELECT \ud800 FROM t'],
+    ['byte order mark before SELECT', '﻿SELECT 1'],
+  ], false);
+  // ...while the same characters are plain data inside a literal or [identifier]
+  expectAll([
+    ['emoji in a literal', "SELECT '😀'"],
+    ['lone surrogate in a literal', "SELECT '\ud800'"],
+    ['lookalike EXEC in a literal', "SELECT N'ЕXEC'"],
+    ['lookalike EXEC in brackets', 'SELECT [ЕXEC] FROM t'],
+  ], true);
+});
+
+test('a stored procedure cannot be called without EXEC', () => {
+  // T-SQL lets a procedure name stand alone as the first statement of a batch.
+  // The leading-keyword rule is what stops that.
+  expectAll([
+    ['bare procedure', 'sp_who'],
+    ['bare extended procedure', "xp_cmdshell 'dir'"],
+    ['schema-qualified', 'sys.sp_who'],
+    ['three-part', "master..xp_cmdshell 'dir'"],
+    ['bracketed', '[sp_who]'],
+    ['after a leading semicolon', ';sp_who'],
+  ], false);
+});
+
+test('hex literal followed by a word is rejected (SQL Server splits them)', () => {
+  // Verified against SQL Server: `SELECT 0x1FAS x` lexes as the hex literal
+  // 0x1FA then the word S. So a keyword whose first letter is not a hex digit
+  // can sit directly behind a hex literal.
+  expectAll([
+    ['KILL behind hex', 'SELECT 0x1FKILL 55'],
+    ['INSERT behind hex', 'SELECT 0x1FINSERT INTO t SELECT 1'],
+    ['SHUTDOWN behind hex', 'SELECT 0x1FSHUTDOWN'],
+    ['plain hex then space then keyword', 'SELECT 0x1F KILL 55'],
+  ], false);
+  assert.equal(accepted('SELECT 0x1F, 0xAB FROM t'), true);
+});
+
+test('statement coverage: every reserved statement-starter is blocked after a SELECT', () => {
+  const starters = ['ALTER', 'BACKUP', 'BEGIN', 'BREAK', 'BULK', 'CHECKPOINT', 'CLOSE', 'COMMIT', 'CONTINUE', 'CREATE', 'DEALLOCATE',
+    'DECLARE', 'DELETE', 'DENY', 'DROP', 'EXEC', 'EXECUTE', 'GOTO', 'GRANT', 'IF', 'INSERT', 'KILL', 'MERGE', 'OPEN', 'PRINT',
+    'RAISERROR', 'READTEXT', 'RECONFIGURE', 'RESTORE', 'RETURN', 'REVERT', 'REVOKE', 'ROLLBACK', 'SAVE', 'SET', 'SETUSER',
+    'SHUTDOWN', 'THROW', 'TRUNCATE', 'UPDATE', 'UPDATETEXT', 'USE', 'WAITFOR', 'WHILE', 'WRITETEXT', 'ADD'];
+  const open = starters.filter(k => accepted(`SELECT 1 ${k} x`));
+  assert.deepEqual(open, [], `still accepted after a complete SELECT: ${open.join(', ')}`);
+});
+
+test('statement coverage: words that are ordinary identifiers stay usable', () => {
+  // Verified against SQL Server: each of these works as a column alias. They
+  // begin statements elsewhere (Service Broker, triggers, legacy backup) but
+  // blocking them would reject real columns, so what they could do is left to
+  // database permissions.
+  for (const word of ['send', 'receive', 'move', 'get', 'enable', 'disable', 'load', 'dump', 'status', 'level', 'name', 'value', 'key']) {
+    assert.equal(accepted(`SELECT 1 AS ${word}`), true, word);
+    assert.equal(accepted(`SELECT ${word} FROM t`), true, word);
+  }
+  // END and FETCH are reserved yet legitimate inside a query
+  assert.equal(accepted('SELECT CASE WHEN a = 1 THEN 2 ELSE 3 END FROM t'), true);
+  assert.equal(accepted('SELECT a FROM t ORDER BY a OFFSET 5 ROWS FETCH NEXT 5 ROWS ONLY'), true);
 });
