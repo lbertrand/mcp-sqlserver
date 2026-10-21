@@ -23,6 +23,7 @@ async function runServer() {
       GetForeignKeysTool,
       GetServerInfoTool,
       GetTableStatsTool,
+      GetQueryPlanTool,
       TestConnectionTool,
     } = await import('./tools/index.js');
     const { ErrorHandler } = await import('./errors.js');
@@ -97,7 +98,9 @@ async function runServer() {
               content: [
                 {
                   type: 'text',
-                  text: JSON.stringify(result, null, 2),
+                  // A tool that returns a string (an execution plan) is sent as-is:
+                  // JSON.stringify would escape every quote and newline in the XML.
+                  text: typeof result === 'string' ? result : JSON.stringify(result, null, 2),
                 },
               ],
             };
@@ -132,6 +135,7 @@ async function runServer() {
           GetForeignKeysTool,
           GetServerInfoTool,
           GetTableStatsTool,
+          GetQueryPlanTool,
         ];
 
         for (const ToolClass of toolClasses) {

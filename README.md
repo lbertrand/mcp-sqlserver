@@ -118,6 +118,29 @@ Try these commands in Claude Desktop:
 - `execute_query` - Execute read-only SELECT queries with safety validation
 - `get_server_info` - Get SQL Server version, edition, and configuration details
 
+### Query Tuning
+- `get_query_plan` - Get the execution plan, as XML, for a read-only SELECT. See below.
+
+#### `get_query_plan`
+
+| Argument | Meaning |
+|---|---|
+| `query` | A single `SELECT` or `WITH` statement. It goes through the same read-only validation as `execute_query`. |
+| `estimated` | `true` (default): the query is compiled but **not run**, so it is safe on large tables. `false`: the query **is run**, its result rows are discarded, and the *actual* plan is returned, with real row counts. |
+
+The plan is returned as raw XML text. It is for the query exactly as written: unlike `execute_query`, no
+`TOP` is added, because that would change the plan.
+
+Each call opens its own connection and closes it when done; it never uses the shared pool. The plan modes
+are session settings (`SET SHOWPLAN_XML`, `SET STATISTICS XML`), and a failure part-way through, such as a
+timeout or a missing permission, would otherwise leave a pooled connection in plan mode for the next caller.
+Closing the connection ends the session, which also cancels a query still running on the server. At most
+three plan calls run at once. If `SQLSERVER_SESSION_CONTEXT` is set, it is applied to the plan connection too.
+
+**Permission:** the login needs `SHOWPLAN` in every database the query touches (`GRANT SHOWPLAN TO <login>;`).
+Without it SQL Server answers `SHOWPLAN permission denied` (error 262), reported as a permission error.
+Queries over system catalog views do not need it.
+
 ## Common Commands for Claude Desktop
 
 Once your MCP server is configured, try these natural language commands:

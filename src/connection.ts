@@ -1,20 +1,33 @@
 import sql from 'mssql';
 import { ConnectionConfig } from './types.js';
 
+/** The slice of sql.ConnectionPool that getQueryPlan uses; lets tests supply a fake. */
+export interface PlanPool {
+  connect(): Promise<unknown>;
+  close(): Promise<unknown>;
+  request(): any;
+}
+export type PlanPoolFactory = (config: sql.config) => PlanPool;
+
+/** Plan calls open their own connection each, so cap how many can be open at once. */
+const MAX_CONCURRENT_PLANS = 3;
+const PLAN_COLUMN_MARKER = 'XML Showplan';
+
 export class SqlServerConnection {
   private pool: sql.ConnectionPool | null = null;
   private config: ConnectionConfig;
+  private planSlotsInUse = 0;
+  private planWaiters: Array<() => void> = [];
 
-  constructor(config: ConnectionConfig) {
+  constructor(
+    config: ConnectionConfig,
+    private readonly planPoolFactory: PlanPoolFactory = cfg => new sql.ConnectionPool(cfg)
+  ) {
     this.config = config;
   }
 
-  async connect(): Promise<void> {
-    if (this.pool) {
-      return;
-    }
-
-    const sqlConfig: sql.config = {
+  private buildSqlConfig(pool: sql.config['pool']): sql.config {
+    return {
       server: this.config.server,
       database: this.config.database,
       user: this.config.user,
@@ -26,14 +39,18 @@ export class SqlServerConnection {
         connectTimeout: this.config.connectionTimeout,
         requestTimeout: this.config.requestTimeout,
       },
-      pool: {
-        max: 10,
-        min: 0,
-        idleTimeoutMillis: 30000,
-      },
+      pool,
     };
+  }
 
-    this.pool = new sql.ConnectionPool(sqlConfig);
+  async connect(): Promise<void> {
+    if (this.pool) {
+      return;
+    }
+
+    this.pool = new sql.ConnectionPool(
+      this.buildSqlConfig({ max: 10, min: 0, idleTimeoutMillis: 30000 })
+    );
     await this.pool.connect();
   }
 
@@ -126,6 +143,128 @@ export class SqlServerConnection {
 
     await this.disconnect();
     await this.connect();
+  }
+
+  /**
+   * Returns the execution plan XML for a query, on a connection used for this
+   * one call and then closed.
+   *
+   * Plan modes are session settings (SET SHOWPLAN_XML, SET STATISTICS XML). On a
+   * pooled connection a failure between the SET and its OFF -- a timeout, or a
+   * permission error, which aborts the batch -- leaves the connection in plan
+   * mode for whoever uses it next, and in SHOWPLAN_XML mode queries return plans
+   * instead of rows. So this never touches the shared pool: the connection is
+   * closed in every case, which ends the session and takes the setting with it.
+   * Closing also cancels a query still running server-side.
+   *
+   * The pool created here has a single connection, so the SET and the query
+   * that follows it are guaranteed to share a session.
+   *
+   * estimated=true compiles the query without running it (SET SHOWPLAN_XML must
+   * be alone in its batch, hence separate batches). estimated=false runs it with
+   * SET STATISTICS XML ON in one batch; result rows are discarded as they
+   * arrive so a large result set is never held in memory. The SETs go through
+   * batch(): mssql's query() sends text via sp_executesql, where they do not
+   * persist.
+   *
+   * The caller must have validated queryText; it is embedded as given, and no
+   * row limit is added, so the plan is for the query as written.
+   */
+  async getQueryPlan(queryText: string, estimated: boolean): Promise<string> {
+    await this.acquirePlanSlot();
+    const pool = this.planPoolFactory(this.buildSqlConfig({ max: 1, min: 0 }));
+    try {
+      await pool.connect();
+
+      // Row-level security needs the session context before the query is
+      // compiled. Fresh connection, so there is no already-set key to guard.
+      const contextRequest = pool.request();
+      const preamble = this.applySessionContext(contextRequest);
+      if (preamble) {
+        await contextRequest.query(preamble);
+      }
+
+      if (estimated) {
+        await pool.request().batch('SET SHOWPLAN_XML ON');
+        const result = await pool.request().batch(queryText);
+        return this.extractPlan(result.recordsets);
+      }
+
+      return await this.runCapturingPlan(
+        pool,
+        `SET STATISTICS XML ON;\n${queryText}\n;\nSET STATISTICS XML OFF;`
+      );
+    } finally {
+      try {
+        await pool.close();
+      } catch {
+        // The connection is discarded either way.
+      }
+      this.releasePlanSlot();
+    }
+  }
+
+  private extractPlan(recordsets: ReadonlyArray<ReadonlyArray<Record<string, unknown>>>): string {
+    const plans: string[] = [];
+    for (const recordset of recordsets ?? []) {
+      for (const row of recordset) {
+        const value = Object.values(row)[0];
+        if (typeof value === 'string' && value.startsWith('<ShowPlanXML')) {
+          plans.push(value);
+        }
+      }
+    }
+    if (plans.length === 0) {
+      throw new Error('SQL Server returned no execution plan');
+    }
+    return plans.join('\n');
+  }
+
+  private runCapturingPlan(pool: PlanPool, batchText: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const request = pool.request();
+      request.stream = true;
+      let inPlanRecordset = false;
+      const plans: string[] = [];
+
+      request.on('recordset', (columns: Record<string, unknown>) => {
+        inPlanRecordset = Object.keys(columns).some(name => name.includes(PLAN_COLUMN_MARKER));
+      });
+      request.on('row', (row: Record<string, unknown>) => {
+        if (!inPlanRecordset) {
+          return; // a result row: discarded, never accumulated
+        }
+        const value = Object.values(row)[0];
+        if (typeof value === 'string') {
+          plans.push(value);
+        }
+      });
+      request.on('error', reject);
+      request.on('done', () =>
+        plans.length > 0
+          ? resolve(plans.join('\n'))
+          : reject(new Error('SQL Server returned no execution plan'))
+      );
+
+      request.batch(batchText);
+    });
+  }
+
+  private async acquirePlanSlot(): Promise<void> {
+    if (this.planSlotsInUse < MAX_CONCURRENT_PLANS) {
+      this.planSlotsInUse++;
+      return;
+    }
+    await new Promise<void>(resolve => this.planWaiters.push(resolve));
+  }
+
+  private releasePlanSlot(): void {
+    const next = this.planWaiters.shift();
+    if (next) {
+      next(); // hand the slot straight to the next waiter
+    } else {
+      this.planSlotsInUse--;
+    }
   }
 
   async testConnection(): Promise<boolean> {

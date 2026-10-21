@@ -7,4 +7,5 @@ export { ExecuteQueryTool } from './execute-query.js';
 export { GetForeignKeysTool } from './get-foreign-keys.js';
 export { GetServerInfoTool } from './get-server-info.js';
 export { GetTableStatsTool } from './get-table-stats.js';
+export { GetQueryPlanTool } from './get-query-plan.js';
 export { TestConnectionTool } from './test-connection.js';
